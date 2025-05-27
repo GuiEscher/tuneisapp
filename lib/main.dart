@@ -8,12 +8,42 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:archive/archive.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:open_file/open_file.dart';
+import 'package:intl/intl.dart';
 
 void main() {
   runApp(MaterialApp(
-    home: TunnelInspectionApp(),
+    home: SplashScreen(),
     debugShowCheckedModeBanner: false,
   ));
+}
+
+class SplashScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    Future.delayed(Duration(seconds: 3), () {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (context) => TunnelInspectionApp()),
+      );
+    });
+
+    return Scaffold(
+      backgroundColor: Colors.deepPurpleAccent,
+      body: Center(
+        child: Text(
+          "Túneis App",
+          style: GoogleFonts.poppins(
+            fontSize: 36,
+            fontWeight: FontWeight.bold,
+            color: Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class TunnelInspectionApp extends StatefulWidget {
@@ -28,7 +58,7 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
   String _serverResponse = "Aguardando ação...";
   bool _isLoading = false;
   List<dynamic> _detections = [];
-  String _serverUrl = "http://192.168.0.11:5000";
+  String _serverUrl = "https://backendtuneisapp-fcue.onrender.com";
   VideoPlayerController? _videoController;
   bool _isVideoPlaying = false;
   List<File> _processedFrames = [];
@@ -199,13 +229,10 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
       if (response.statusCode == 200) {
         final responseBody = await response.stream.toBytes();
         
-        // Verifica se é um vídeo (retorna ZIP) ou imagem (retorna JPEG)
         if (response.headers['content-type']?.toLowerCase().contains('application/zip') ?? false) {
-          // Processamento de vídeo - extrai frames do ZIP
           final archive = ZipDecoder().decodeBytes(responseBody);
           final directory = await getApplicationDocumentsDirectory();
           
-          // Ordena os arquivos pelo nome para manter a ordem dos frames
           var files = archive.files.where((file) => file.name.endsWith('.jpg')).toList();
           files.sort((a, b) => a.name.compareTo(b.name));
           
@@ -222,7 +249,6 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
             _videoController = null;
           });
         } else {
-          // Processamento de imagem normal
           final directory = await getApplicationDocumentsDirectory();
           final filePath = '${directory.path}/processed_${DateTime.now().millisecondsSinceEpoch}.jpg';
           await File(filePath).writeAsBytes(responseBody);
@@ -236,7 +262,6 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
           });
         }
 
-        // Processa as detecções
         final detectionsHeader = response.headers['detections'];
         if (detectionsHeader != null) {
           try {
@@ -248,7 +273,6 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
           }
         }
 
-        // Processa os logs
         final logsHeader = response.headers['logs'];
         if (logsHeader != null) {
           try {
@@ -279,8 +303,224 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
     }
   }
 
-  bool _isImageResponse(String? contentType) {
-    return contentType?.toLowerCase().contains('image/jpeg') ?? false;
+  Future<void> _generateReport() async {
+    if (_detections.isEmpty && _processLogs.isEmpty) {
+      setState(() {
+        _serverResponse = "Nenhuma análise realizada para gerar relatório!";
+      });
+      return;
+    }
+
+    final pdf = pw.Document();
+    final date = DateFormat('dd/MM/yyyy HH:mm:ss').format(DateTime.now());
+    final shortDate = DateFormat('dd/MM/yyyy').format(DateTime.now());
+
+    // Load font for better styling
+    final font = await pw.Font.ttf(await DefaultAssetBundle.of(context).load('assets/fonts/Poppins-Regular.ttf'));
+    final boldFont = await pw.Font.ttf(await DefaultAssetBundle.of(context).load('assets/fonts/Poppins-Bold.ttf'));
+
+    // Load processed image if available
+    pw.ImageProvider? imageProvider;
+    if (_processedFrames.isNotEmpty) {
+      final imageBytes = await _processedFrames[_currentFrameIndex].readAsBytes();
+      imageProvider = pw.MemoryImage(imageBytes);
+    }
+
+    // Count detections by class
+    final detectionCounts = <String, int>{};
+    for (var detection in _detections) {
+      final className = detection['class'] as String;
+      detectionCounts[className] = (detectionCounts[className] ?? 0) + 1;
+    }
+    final totalDetections = _detections.length;
+
+    // Build introduction text
+    final introText = totalDetections > 0
+        ? 'Na análise realizada no dia $shortDate, foram encontradas $totalDetections anomalias nas imagens processadas pelo Túneis App. '
+          'O sistema identificou as seguintes condições: '
+          '${detectionCounts.entries.map((e) => "${e.value} ocorrência(s) de ${e.key.toLowerCase()}").toList().asMap().entries.map((e) => e.key == detectionCounts.length - 1 ? e.value : "${e.value}, ").join("")}${detectionCounts.length > 1 ? "" : ""}. '
+          'O Túneis App utiliza inteligência artificial avançada para detectar anomalias como umidade, corrosão e rachaduras em estruturas de túneis, '
+          'fornecendo informações críticas para a manutenção preventiva e a segurança operacional. '
+        : 'Na análise realizada no dia $shortDate, nenhuma anomalia foi detectada nas imagens processadas pelo Túneis App. '
+          'O Túneis App emprega tecnologia de inteligência artificial para identificar anomalias como umidade, corrosão e rachaduras em túneis, '
+          'garantindo a integridade estrutural por meio de monitoramento automatizado. '
+          'A ausência de detecções neste relatório sugere que a seção inspecionada está em condições adequadas, mas recomenda-se a continuidade das inspeções regulares.';
+
+    pdf.addPage(
+      pw.Page(
+        pageFormat: PdfPageFormat.a4,
+        build: (pw.Context context) {
+          return pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              // Header
+              pw.Container(
+                padding: pw.EdgeInsets.all(20),
+                color: PdfColors.deepPurple,
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.center,
+                  children: [
+                    pw.Text(
+                      'Túneis App - Relatório de Análise',
+                      style: pw.TextStyle(
+                        font: boldFont,
+                        fontSize: 24,
+                        color: PdfColors.white,
+                      ),
+                    ),
+                    pw.SizedBox(height: 8),
+                    pw.Text(
+                      date,
+                      style: pw.TextStyle(
+                        font: font,
+                        fontSize: 12,
+                        color: PdfColors.white,
+                        fontStyle: pw.FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              pw.SizedBox(height: 20),
+
+              // Introduction
+              pw.Text(
+                'Introdução',
+                style: pw.TextStyle(
+                  font: boldFont,
+                  fontSize: 18,
+                  color: PdfColors.deepPurple,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              pw.Text(
+                introText,
+                style: pw.TextStyle(
+                  font: font,
+                  fontSize: 12,
+                  lineSpacing: 1.5,
+                ),
+                textAlign: pw.TextAlign.justify,
+              ),
+              pw.SizedBox(height: 20),
+
+              // Analysis Results
+              pw.Text(
+                'Resultados da Análise',
+                style: pw.TextStyle(
+                  font: boldFont,
+                  fontSize: 18,
+                  color: PdfColors.deepPurple,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              if (_detections.isNotEmpty)
+                pw.Table(
+                  border: pw.TableBorder.all(color: PdfColors.grey300),
+                  children: [
+                    pw.TableRow(
+                      decoration: pw.BoxDecoration(color: PdfColors.grey200),
+                      children: [
+                        pw.Padding(
+                          padding: pw.EdgeInsets.all(8),
+                          child: pw.Text('Classe', style: pw.TextStyle(font: boldFont)),
+                        ),
+                        pw.Padding(
+                          padding: pw.EdgeInsets.all(8),
+                          child: pw.Text('Confiança', style: pw.TextStyle(font: boldFont)),
+                        ),
+                      ],
+                    ),
+                    ..._detections.map((detection) => pw.TableRow(
+                          children: [
+                            pw.Padding(
+                              padding: pw.EdgeInsets.all(8),
+                              child: pw.Text(detection['class'], style: pw.TextStyle(font: font)),
+                            ),
+                            pw.Padding(
+                              padding: pw.EdgeInsets.all(8),
+                              child: pw.Text(
+                                '${(detection['confidence'] * 100).toStringAsFixed(1)}%',
+                                style: pw.TextStyle(font: font),
+                              ),
+                            ),
+                          ],
+                        )),
+                  ],
+                )
+              else
+                pw.Text(
+                  'Nenhuma detecção encontrada.',
+                  style: pw.TextStyle(font: font, fontSize: 14),
+                ),
+              pw.SizedBox(height: 20),
+
+              // Processed Image
+              if (imageProvider != null) ...[
+                pw.Text(
+                  'Imagem Processada',
+                  style: pw.TextStyle(
+                    font: boldFont,
+                    fontSize: 18,
+                    color: PdfColors.deepPurple,
+                  ),
+                ),
+                pw.SizedBox(height: 10),
+                pw.Image(
+                  imageProvider,
+                  width: 300,
+                  height: 200,
+                  fit: pw.BoxFit.contain,
+                ),
+                pw.SizedBox(height: 20),
+              ],
+
+              // Processing Logs
+              pw.Text(
+                'Logs de Processamento',
+                style: pw.TextStyle(
+                  font: boldFont,
+                  fontSize: 18,
+                  color: PdfColors.deepPurple,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              if (_processLogs.isNotEmpty)
+                pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: _processLogs.map((log) => pw.Padding(
+                        padding: pw.EdgeInsets.only(bottom: 5),
+                        child: pw.Text(
+                          log,
+                          style: pw.TextStyle(
+                            font: font,
+                            fontSize: 12,
+                            color: log.contains('Erro') ? PdfColors.red : PdfColors.black,
+                          ),
+                        ),
+                      )).toList(),
+                )
+              else
+                pw.Text(
+                  'Nenhum log disponível.',
+                  style: pw.TextStyle(font: font, fontSize: 14),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+
+    // Save and open the PDF
+    final directory = await getApplicationDocumentsDirectory();
+    final filePath = '${directory.path}/tuneisapp_report_${DateTime.now().millisecondsSinceEpoch}.pdf';
+    final file = File(filePath);
+    await file.writeAsBytes(await pdf.save());
+    await OpenFile.open(filePath);
+
+    setState(() {
+      _serverResponse = "Relatório gerado com sucesso!";
+    });
   }
 
   void _showFullScreenImage(File imageFile) {
@@ -443,6 +683,17 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
             ),
             SizedBox(height: 10),
             
+            ElevatedButton(
+              child: Text('Gerar Relatório'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.deepPurpleAccent,
+                foregroundColor: Colors.white,
+                padding: EdgeInsets.symmetric(vertical: 15),
+              ),
+              onPressed: _generateReport,
+            ),
+            SizedBox(height: 10),
+            
             Card(
               elevation: 4,
               child: Padding(
@@ -471,19 +722,16 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
                       ),
                       SizedBox(height: 10),
                       ..._detections.map((detection) => ListTile(
-                        leading: Container(
-                          width: 20,
-                          height: 20,
-                          color: _getColorForDetection(detection['class']),
-                        ),
-                        title: Text(
-                          "${detection['class']} (${(detection['confidence'] * 100).toStringAsFixed(1)}%)",
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        subtitle: Text(
-                          "Área: ${detection['area'].toStringAsFixed(0)} px²",
-                        ),
-                      )).toList(),
+                            leading: Container(
+                              width: 20,
+                              height: 20,
+                              color: _getColorForDetection(detection['class']),
+                            ),
+                            title: Text(
+                              "${detection['class']} (${(detection['confidence'] * 100).toStringAsFixed(1)}%)",
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          )).toList(),
                     ],
                   ],
                 ),
@@ -518,7 +766,7 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
                               child: Text(
                                 _processLogs[index],
                                 style: TextStyle(
-                                  fontFamily: 'monospace', 
+                                  fontFamily: 'monospace',
                                   fontSize: 12,
                                   color: _processLogs[index].contains('Erro') ? Colors.red : Colors.black,
                                 ),
