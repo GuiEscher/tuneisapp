@@ -35,5 +35,9 @@ Com uma interface intuitiva, captura de mídia, análise em tempo real e geraç�
 ```bash
 git clone <repository-url>
 cd tuneis-app
+```
 
+## Backend
+
+- ** Servidor de backend**: O servidor está hospedado no render.com, porém é um servidor bem limitado. O código pode ser encontrado em https://github.com/GuiEscher/backendtuneisapp. É possível clocar o servidor e rodar localmente apenas alterando a rota da requisição para o endereço ipv4 da sua máquina, ficando como no exemplo: https://192.x.x.x/detect. 
 
