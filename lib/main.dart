@@ -13,6 +13,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:open_file/open_file.dart';
 import 'package:intl/intl.dart';
+import 'dart:typed_data';
 
 void main() {
   runApp(MaterialApp(
@@ -91,28 +92,6 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
     } catch (e) {
       setState(() {
         _serverResponse = "Erro ao capturar imagem: ${e.toString()}";
-      });
-    }
-  }
-
-  Future<void> _captureVideo() async {
-    try {
-      final XFile? pickedFile = await _picker.pickVideo(source: ImageSource.camera);
-      if (pickedFile != null) {
-        setState(() {
-          _video = File(pickedFile.path);
-          _image = null;
-          _processedFrames.clear();
-          _currentFrameIndex = 0;
-          _processLogs.clear();
-          _initializeVideoPlayer();
-          _serverResponse = "Vídeo capturado. Pronto para análise.";
-          _detections = [];
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _serverResponse = "Erro ao capturar vídeo: ${e.toString()}";
       });
     }
   }
@@ -200,111 +179,123 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
       _processLogs.clear();
     });
 
-    try {
-      var request = http.MultipartRequest(
-        'POST',
-        Uri.parse('$_serverUrl/detect'),
-      );
-
-      if (_image != null) {
-        request.files.add(
-          await http.MultipartFile.fromPath(
-            'file',
-            _image!.path,
-            contentType: MediaType('image', 'jpeg'),
-          ),
+    const maxRetries = 3;
+    const retryDelay = Duration(seconds: 5);
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        var request = http.MultipartRequest(
+          'POST',
+          Uri.parse('$_serverUrl/detect'),
         );
-      } else if (_video != null) {
-        request.files.add(
-          await http.MultipartFile.fromPath(
-            'file',
-            _video!.path,
-            contentType: MediaType('video', 'mp4'),
-          ),
-        );
-      }
 
-      var response = await request.send();
+        if (_image != null) {
+          request.files.add(
+            await http.MultipartFile.fromPath(
+              'file',
+              _image!.path,
+              contentType: MediaType('image', 'jpeg'),
+            ),
+          );
+        } else if (_video != null) {
+          request.files.add(
+            await http.MultipartFile.fromPath(
+              'file',
+              _video!.path,
+              contentType: MediaType('video', 'mp4'),
+            ),
+          );
+        }
 
-      if (response.statusCode == 200) {
-        final responseBody = await response.stream.toBytes();
-        
-        if (response.headers['content-type']?.toLowerCase().contains('application/zip') ?? false) {
-          final archive = ZipDecoder().decodeBytes(responseBody);
-          final directory = await getApplicationDocumentsDirectory();
+        var response = await request.send();
+
+        if (response.statusCode == 200) {
+          final responseBody = await response.stream.toBytes();
           
-          var files = archive.files.where((file) => file.name.endsWith('.jpg')).toList();
-          files.sort((a, b) => a.name.compareTo(b.name));
-          
-          for (final file in files) {
-            final frameFile = File('${directory.path}/${file.name}');
-            await frameFile.writeAsBytes(file.content);
-            _processedFrames.add(frameFile);
+          if (response.headers['content-type']?.toLowerCase().contains('application/zip') ?? false) {
+            final archive = ZipDecoder().decodeBytes(responseBody);
+            final directory = await getApplicationDocumentsDirectory();
+            
+            var files = archive.files.where((file) => file.name.endsWith('.jpg')).toList();
+            files.sort((a, b) => a.name.compareTo(b.name));
+            
+            for (final file in files) {
+              final frameFile = File('${directory.path}/${file.name}');
+              await frameFile.writeAsBytes(file.content);
+              _processedFrames.add(frameFile);
+              print("Frame ${file.name} salvo, tamanho: ${file.content.length} bytes");
+            }
+            
+            setState(() {
+              _totalFrames = int.tryParse(response.headers['frame-count'] ?? '') ?? _processedFrames.length;
+              _video = null;
+              _videoController?.dispose();
+              _videoController = null;
+            });
+          } else {
+            final directory = await getApplicationDocumentsDirectory();
+            final filePath = '${directory.path}/processed_${DateTime.now().millisecondsSinceEpoch}.jpg';
+            await File(filePath).writeAsBytes(responseBody);
+            
+            setState(() {
+              _image = File(filePath);
+              _video = null;
+              _videoController?.dispose();
+              _videoController = null;
+              _processedFrames.add(_image!);
+              print("Imagem processada salva, tamanho: ${responseBody.length} bytes");
+            });
           }
-          
+
+          final detectionsHeader = response.headers['detections'];
+          if (detectionsHeader != null) {
+            try {
+              setState(() {
+                _detections = json.decode(detectionsHeader);
+              });
+            } catch (e) {
+              print("Erro ao decodificar detecções: $e");
+            }
+          }
+
+          final logsHeader = response.headers['logs'];
+          if (logsHeader != null) {
+            try {
+              setState(() {
+                _processLogs = List<String>.from(json.decode(logsHeader));
+              });
+            } catch (e) {
+              print("Erro ao decodificar logs: $e");
+            }
+          }
+
           setState(() {
-            _totalFrames = int.tryParse(response.headers['frame-count'] ?? '') ?? _processedFrames.length;
-            _video = null;
-            _videoController?.dispose();
-            _videoController = null;
+            _serverResponse = "Análise concluída com sucesso!";
+            _isLoading = false;
           });
+          return; // Success, exit function
         } else {
-          final directory = await getApplicationDocumentsDirectory();
-          final filePath = '${directory.path}/processed_${DateTime.now().millisecondsSinceEpoch}.jpg';
-          await File(filePath).writeAsBytes(responseBody);
-          
           setState(() {
-            _image = File(filePath);
-            _video = null;
-            _videoController?.dispose();
-            _videoController = null;
-            _processedFrames.add(_image!);
+            _serverResponse = "Erro no servidor: ${response.statusCode}";
+            _isLoading = false;
           });
+          return; // Exit on non-200 status
         }
-
-        final detectionsHeader = response.headers['detections'];
-        if (detectionsHeader != null) {
-          try {
-            setState(() {
-              _detections = json.decode(detectionsHeader);
-            });
-          } catch (e) {
-            print("Erro ao decodificar detecções: $e");
-          }
+      } catch (e) {
+        print("Tentativa $attempt falhou: $e");
+        if (attempt == maxRetries) {
+          setState(() {
+            _serverResponse = "Erro na comunicação: ${e.toString()}";
+            _isLoading = false;
+          });
+          return;
         }
-
-        final logsHeader = response.headers['logs'];
-        if (logsHeader != null) {
-          try {
-            setState(() {
-              _processLogs = List<String>.from(json.decode(logsHeader));
-            });
-          } catch (e) {
-            print("Erro ao decodificar logs: $e");
-          }
-        }
-
-        setState(() {
-          _serverResponse = "Análise concluída com sucesso!";
-          _isLoading = false;
-        });
-      } else {
-        setState(() {
-          _serverResponse = "Erro no servidor: ${response.statusCode}";
-          _isLoading = false;
-        });
+        await Future.delayed(retryDelay);
       }
-    } catch (e) {
-      setState(() {
-        _serverResponse = "Erro na comunicação: ${e.toString()}";
-        _isLoading = false;
-      });
-      print("Erro detalhado: $e");
     }
   }
 
   Future<void> _generateReport() async {
-    if (_detections.isEmpty && _processLogs.isEmpty) {
+    if (_detections.isEmpty && _processLogs.isEmpty && _processedFrames.isEmpty) {
       setState(() {
         _serverResponse = "Nenhuma análise realizada para gerar relatório!";
       });
@@ -318,13 +309,6 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
     // Load font for better styling
     final font = await pw.Font.ttf(await DefaultAssetBundle.of(context).load('assets/fonts/Poppins-Regular.ttf'));
     final boldFont = await pw.Font.ttf(await DefaultAssetBundle.of(context).load('assets/fonts/Poppins-Bold.ttf'));
-
-    // Load processed image if available
-    pw.ImageProvider? imageProvider;
-    if (_processedFrames.isNotEmpty) {
-      final imageBytes = await _processedFrames[_currentFrameIndex].readAsBytes();
-      imageProvider = pw.MemoryImage(imageBytes);
-    }
 
     // Count detections by class
     final detectionCounts = <String, int>{};
@@ -341,172 +325,201 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
           '${detectionCounts.entries.map((e) => "${e.value} ocorrência(s) de ${e.key.toLowerCase()}").toList().asMap().entries.map((e) => e.key == detectionCounts.length - 1 ? e.value : "${e.value}, ").join("")}${detectionCounts.length > 1 ? "" : ""}. '
           'O Túneis App utiliza inteligência artificial avançada para detectar anomalias como umidade, corrosão e rachaduras em estruturas de túneis, '
           'fornecendo informações críticas para a manutenção preventiva e a segurança operacional. '
+          'As detecções apresentadas neste relatório indicam áreas que requerem atenção imediata, com níveis de confiança associados a cada identificação. '
+          'Recomenda-se uma inspeção detalhada por equipes técnicas para avaliar as condições identificadas e planejar ações corretivas.'
         : 'Na análise realizada no dia $shortDate, nenhuma anomalia foi detectada nas imagens processadas pelo Túneis App. '
           'O Túneis App emprega tecnologia de inteligência artificial para identificar anomalias como umidade, corrosão e rachaduras em túneis, '
           'garantindo a integridade estrutural por meio de monitoramento automatizado. '
           'A ausência de detecções neste relatório sugere que a seção inspecionada está em condições adequadas, mas recomenda-se a continuidade das inspeções regulares.';
 
+    // Load all processed frames
+    final frameProviders = <pw.ImageProvider>[];
+    for (var frame in _processedFrames) {
+      try {
+        final imageBytes = await frame.readAsBytes();
+        frameProviders.add(pw.MemoryImage(imageBytes));
+        print("Frame adicionado ao PDF, tamanho: ${imageBytes.length} bytes");
+      } catch (e) {
+        print("Erro ao carregar frame para PDF: $e");
+        _processLogs.add("Erro ao carregar frame ${frame.path}: $e");
+      }
+    }
+
     pdf.addPage(
-      pw.Page(
+      pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
         build: (pw.Context context) {
-          return pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
-              // Header
-              pw.Container(
-                padding: pw.EdgeInsets.all(20),
+          return [
+            // Header
+            pw.Container(
+              padding: pw.EdgeInsets.all(20),
+              color: PdfColors.deepPurple,
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.center,
+                children: [
+                  pw.Text(
+                    'Túneis App - Relatório de Análise',
+                    style: pw.TextStyle(
+                      font: boldFont,
+                      fontSize: 24,
+                      color: PdfColors.white,
+                    ),
+                  ),
+                  pw.SizedBox(height: 8),
+                  pw.Text(
+                    date,
+                    style: pw.TextStyle(
+                      font: font,
+                      fontSize: 12,
+                      color: PdfColors.white,
+                      fontStyle: pw.FontStyle.italic,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            pw.SizedBox(height: 20),
+
+            // Introduction
+            pw.Text(
+              'Introdução',
+              style: pw.TextStyle(
+                font: boldFont,
+                fontSize: 18,
                 color: PdfColors.deepPurple,
-                child: pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.center,
+              ),
+            ),
+            pw.SizedBox(height: 10),
+            pw.Text(
+              introText,
+              style: pw.TextStyle(
+                font: font,
+                fontSize: 12,
+                lineSpacing: 1.5,
+              ),
+              textAlign: pw.TextAlign.justify,
+            ),
+            pw.SizedBox(height: 20),
+
+            // Analysis Results
+            pw.Text(
+              'Resultados da Análise',
+              style: pw.TextStyle(
+                font: boldFont,
+                fontSize: 18,
+                color: PdfColors.deepPurple,
+              ),
+            ),
+            pw.SizedBox(height: 10),
+            if (_detections.isNotEmpty)
+              pw.Table(
+                border: pw.TableBorder.all(color: PdfColors.grey300),
+                children: [
+                  pw.TableRow(
+                    decoration: pw.BoxDecoration(color: PdfColors.grey200),
+                    children: [
+                      pw.Padding(
+                        padding: pw.EdgeInsets.all(8),
+                        child: pw.Text('Classe', style: pw.TextStyle(font: boldFont)),
+                      ),
+                      pw.Padding(
+                        padding: pw.EdgeInsets.all(8),
+                        child: pw.Text('Confiança', style: pw.TextStyle(font: boldFont)),
+                      ),
+                    ],
+                  ),
+                  ..._detections.map((detection) => pw.TableRow(
+                        children: [
+                          pw.Padding(
+                            padding: pw.EdgeInsets.all(8),
+                            child: pw.Text(detection['class'], style: pw.TextStyle(font: font)),
+                          ),
+                          pw.Padding(
+                            padding: pw.EdgeInsets.all(8),
+                            child: pw.Text(
+                              '${(detection['confidence'] * 100).toStringAsFixed(1)}%',
+                              style: pw.TextStyle(font: font),
+                            ),
+                          ),
+                        ],
+                      )),
+                ],
+              )
+            else
+              pw.Text(
+                'Nenhuma detecção encontrada.',
+                style: pw.TextStyle(font: font, fontSize: 14),
+              ),
+            pw.SizedBox(height: 20),
+
+            // Processed Images
+            if (frameProviders.isNotEmpty) ...[
+              pw.Text(
+                _processedFrames.length > 1 ? 'Imagens Processadas' : 'Imagem Processada',
+                style: pw.TextStyle(
+                  font: boldFont,
+                  fontSize: 18,
+                  color: PdfColors.deepPurple,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              ...frameProviders.asMap().entries.map((entry) {
+                final index = entry.key;
+                final provider = entry.value;
+                return pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: [
                     pw.Text(
-                      'Túneis App - Relatório de Análise',
+                      _processedFrames.length > 1 ? 'Frame ${index + 1}' : 'Imagem',
                       style: pw.TextStyle(
                         font: boldFont,
-                        fontSize: 24,
-                        color: PdfColors.white,
+                        fontSize: 14,
                       ),
                     ),
-                    pw.SizedBox(height: 8),
-                    pw.Text(
-                      date,
-                      style: pw.TextStyle(
-                        font: font,
-                        fontSize: 12,
-                        color: PdfColors.white,
-                        fontStyle: pw.FontStyle.italic,
-                      ),
+                    pw.SizedBox(height: 5),
+                    pw.Image(
+                      provider,
+                      width: 300,
+                      height: 200,
+                      fit: pw.BoxFit.contain,
                     ),
+                    pw.SizedBox(height: 20),
                   ],
-                ),
-              ),
-              pw.SizedBox(height: 20),
-
-              // Introduction
-              pw.Text(
-                'Introdução',
-                style: pw.TextStyle(
-                  font: boldFont,
-                  fontSize: 18,
-                  color: PdfColors.deepPurple,
-                ),
-              ),
-              pw.SizedBox(height: 10),
-              pw.Text(
-                introText,
-                style: pw.TextStyle(
-                  font: font,
-                  fontSize: 12,
-                  lineSpacing: 1.5,
-                ),
-                textAlign: pw.TextAlign.justify,
-              ),
-              pw.SizedBox(height: 20),
-
-              // Analysis Results
-              pw.Text(
-                'Resultados da Análise',
-                style: pw.TextStyle(
-                  font: boldFont,
-                  fontSize: 18,
-                  color: PdfColors.deepPurple,
-                ),
-              ),
-              pw.SizedBox(height: 10),
-              if (_detections.isNotEmpty)
-                pw.Table(
-                  border: pw.TableBorder.all(color: PdfColors.grey300),
-                  children: [
-                    pw.TableRow(
-                      decoration: pw.BoxDecoration(color: PdfColors.grey200),
-                      children: [
-                        pw.Padding(
-                          padding: pw.EdgeInsets.all(8),
-                          child: pw.Text('Classe', style: pw.TextStyle(font: boldFont)),
-                        ),
-                        pw.Padding(
-                          padding: pw.EdgeInsets.all(8),
-                          child: pw.Text('Confiança', style: pw.TextStyle(font: boldFont)),
-                        ),
-                      ],
-                    ),
-                    ..._detections.map((detection) => pw.TableRow(
-                          children: [
-                            pw.Padding(
-                              padding: pw.EdgeInsets.all(8),
-                              child: pw.Text(detection['class'], style: pw.TextStyle(font: font)),
-                            ),
-                            pw.Padding(
-                              padding: pw.EdgeInsets.all(8),
-                              child: pw.Text(
-                                '${(detection['confidence'] * 100).toStringAsFixed(1)}%',
-                                style: pw.TextStyle(font: font),
-                              ),
-                            ),
-                          ],
-                        )),
-                  ],
-                )
-              else
-                pw.Text(
-                  'Nenhuma detecção encontrada.',
-                  style: pw.TextStyle(font: font, fontSize: 14),
-                ),
-              pw.SizedBox(height: 20),
-
-              // Processed Image
-              if (imageProvider != null) ...[
-                pw.Text(
-                  'Imagem Processada',
-                  style: pw.TextStyle(
-                    font: boldFont,
-                    fontSize: 18,
-                    color: PdfColors.deepPurple,
-                  ),
-                ),
-                pw.SizedBox(height: 10),
-                pw.Image(
-                  imageProvider,
-                  width: 300,
-                  height: 200,
-                  fit: pw.BoxFit.contain,
-                ),
-                pw.SizedBox(height: 20),
-              ],
-
-              // Processing Logs
-              pw.Text(
-                'Logs de Processamento',
-                style: pw.TextStyle(
-                  font: boldFont,
-                  fontSize: 18,
-                  color: PdfColors.deepPurple,
-                ),
-              ),
-              pw.SizedBox(height: 10),
-              if (_processLogs.isNotEmpty)
-                pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.start,
-                  children: _processLogs.map((log) => pw.Padding(
-                        padding: pw.EdgeInsets.only(bottom: 5),
-                        child: pw.Text(
-                          log,
-                          style: pw.TextStyle(
-                            font: font,
-                            fontSize: 12,
-                            color: log.contains('Erro') ? PdfColors.red : PdfColors.black,
-                          ),
-                        ),
-                      )).toList(),
-                )
-              else
-                pw.Text(
-                  'Nenhum log disponível.',
-                  style: pw.TextStyle(font: font, fontSize: 14),
-                ),
+                );
+              }).toList(),
             ],
-          );
+
+            // Processing Logs
+            pw.Text(
+              'Logs de Processamento',
+              style: pw.TextStyle(
+                font: boldFont,
+                fontSize: 18,
+                color: PdfColors.deepPurple,
+              ),
+            ),
+            pw.SizedBox(height: 10),
+            if (_processLogs.isNotEmpty)
+              pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: _processLogs.map((log) => pw.Padding(
+                      padding: pw.EdgeInsets.only(bottom: 5),
+                      child: pw.Text(
+                        log,
+                        style: pw.TextStyle(
+                          font: font,
+                          fontSize: 12,
+                          color: log.contains('Erro') ? PdfColors.red : PdfColors.black,
+                        ),
+                      ),
+                    )).toList(),
+              )
+            else
+              pw.Text(
+                'Nenhum log disponível.',
+                style: pw.TextStyle(font: font, fontSize: 14),
+              ),
+          ];
         },
       ),
     );
@@ -604,51 +617,32 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                Column(
-                  children: [
-                    ElevatedButton.icon(
-                      icon: Icon(Icons.camera_alt),
-                      label: Text('Foto'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.deepPurple,
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _captureImage,
-                    ),
-                    SizedBox(height: 5),
-                    ElevatedButton.icon(
-                      icon: Icon(Icons.videocam),
-                      label: Text('Vídeo'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.deepPurple,
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _captureVideo,
-                    ),
-                  ],
+                ElevatedButton.icon(
+                  icon: Icon(Icons.camera_alt),
+                  label: Text('Foto'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _captureImage,
                 ),
-                Column(
-                  children: [
-                    ElevatedButton.icon(
-                      icon: Icon(Icons.photo_library),
-                      label: Text('Galeria'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.deepPurple,
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _pickImageFromGallery,
-                    ),
-                    SizedBox(height: 5),
-                    ElevatedButton.icon(
-                      icon: Icon(Icons.video_library),
-                      label: Text('Vídeos'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.deepPurple,
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _pickVideoFromGallery,
-                    ),
-                  ],
+                ElevatedButton.icon(
+                  icon: Icon(Icons.photo_library),
+                  label: Text('Galeria'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _pickImageFromGallery,
+                ),
+                ElevatedButton.icon(
+                  icon: Icon(Icons.video_library),
+                  label: Text('Vídeos'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _pickVideoFromGallery,
                 ),
               ],
             ),
@@ -792,10 +786,25 @@ class _TunnelInspectionAppState extends State<TunnelInspectionApp> {
         onTap: () => _showFullScreenImage(_processedFrames[_currentFrameIndex]),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(8),
-          child: Image.file(
-            _processedFrames[_currentFrameIndex],
-            fit: BoxFit.cover,
-            width: double.infinity,
+          child: FutureBuilder<Uint8List>(
+            future: _processedFrames[_currentFrameIndex].readAsBytes(),
+            builder: (context, snapshot) {
+              if (snapshot.hasData) {
+                return Image.memory(
+                  snapshot.data!,
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  errorBuilder: (context, error, stackTrace) {
+                    print("Erro ao renderizar frame: $error");
+                    return Center(child: Text("Erro ao carregar frame"));
+                  },
+                );
+              } else if (snapshot.hasError) {
+                print("Erro ao carregar bytes do frame: ${snapshot.error}");
+                return Center(child: Text("Erro ao carregar frame"));
+              }
+              return Center(child: CircularProgressIndicator());
+            },
           ),
         ),
       );

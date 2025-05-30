@@ -1,4 +1,4 @@
-name: tuneisappflutter
+name: tuneisapp
 description: "A new Flutter project."
 publish_to: 'none'
 
@@ -22,16 +22,30 @@ dependencies:
   pdf: ^3.11.3
   open_file: ^3.5.10
   intl: ^0.19.0
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.3.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
 
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"
+
+flutter_native_splash:
+  color: "#ffffff"
+  image: assets/icon/app_icon.png
+  android: true
+  ios: true
+
 flutter:
   uses-material-design: true
 
   assets:
+    - assets/icon/app_icon.png
     - assets/drone.png
     - assets/fonts/Poppins-Regular.ttf
     - assets/fonts/Poppins-Bold.ttf
